@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import math
 import random
@@ -13,7 +13,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# Optional heavy imports – fall back gracefully if unavailable
+# Optional heavy imports � fall back gracefully if unavailable
 try:
     import xgboost as xgb
 except Exception:
@@ -100,7 +100,29 @@ def _write_processed_df(df: pd.DataFrame) -> None:
         print("Failed to write CSV:", exc)
 
 
-def ensure_fresh_processed(max_minutes: int = 60) -> pd.DataFrame:
+def ensure_fresh_processed(max_minutes: int = 60, use_real_data: bool = True) -> pd.DataFrame:
+    """Load processed data, optionally using real meter data if available"""
+    
+    # Try to load real meter data first if enabled
+    if use_real_data:
+        real_data_files = [
+            DATA_DIR / "real_meter_data.csv",
+            DATA_DIR / "manual_readings.csv",
+            DATA_DIR / "green_button_data.csv"
+        ]
+        
+        for file_path in real_data_files:
+            if file_path.exists():
+                try:
+                    df_real = pd.read_csv(file_path, parse_dates=["timestamp"])
+                    if not df_real.empty and "timestamp" in df_real.columns and "power" in df_real.columns:
+                        df_real = _ensure_feature_columns(df_real)
+                        print(f"✓ Using real meter data from {file_path.name}")
+                        return df_real
+                except Exception as e:
+                    print(f"Warning: Could not load {file_path.name}: {e}")
+    
+    # Fall back to sample data
     df = _ensure_feature_columns(_read_processed_df())
     if df.empty:
         df = _ensure_feature_columns(_bootstrap_series())
@@ -174,6 +196,7 @@ class ForecastRequest(BaseModel):
     horizon: int = 60
     recent_window: Optional[List[float]] = None
     recent_timestamps: Optional[List[str]] = None
+    debug: bool = False
 
 
 @app.get("/health")
@@ -201,31 +224,65 @@ def predict(req: ForecastRequest):
 
     try:
         if xgb is not None and xgb_model is not None and xgb_features is not None:
-            last = float(req.recent_window[-1])
-            prev = float(req.recent_window[-2]) if len(req.recent_window) > 1 else last
-            rolling_vals = req.recent_window[-3:] if len(req.recent_window) >= 3 else req.recent_window
-            rolling = float(np.mean(rolling_vals)) if rolling_vals else last
+            # Iteratively predict for horizon steps
+            history = list(req.recent_window)
             ts_list = req.recent_timestamps or []
+            
             if ts_list and len(ts_list) == len(req.recent_window):
                 try:
-                    last_ts = datetime.fromisoformat(ts_list[-1])
+                    current_ts = datetime.fromisoformat(ts_list[-1])
                 except ValueError:
-                    last_ts = datetime.utcnow()
+                    current_ts = datetime.utcnow()
             else:
-                last_ts = datetime.utcnow()
-            hour = last_ts.hour + last_ts.minute / 60.0
-            feature_map = {
-                "hour": hour,
-                "sin_hour": float(np.sin(2 * np.pi * hour / 24.0)),
-                "cos_hour": float(np.cos(2 * np.pi * hour / 24.0)),
-                "lag_1": prev,
-                "rolling_3": rolling,
-            }
-            X_vec = [[feature_map.get(name, last) for name in xgb_features]]
-            dmat = xgb.DMatrix(np.array(X_vec), feature_names=xgb_features)
-            preds["xgb"] = float(xgb_model.predict(dmat)[0])
-    except Exception:
+                current_ts = datetime.utcnow()
+            
+            # Store predictions at different intervals for debugging
+            debug_preds = []
+            
+            # Predict step by step for horizon minutes
+            for step in range(req.horizon):
+                # Calculate features for current step
+                current_ts = current_ts + timedelta(minutes=1)
+                last = float(history[-1])
+                prev = float(history[-2]) if len(history) > 1 else last
+                rolling_vals = history[-3:] if len(history) >= 3 else history
+                rolling = float(np.mean(rolling_vals)) if rolling_vals else last
+                
+                hour = current_ts.hour + current_ts.minute / 60.0
+                dow = current_ts.weekday()  # 0=Monday, 6=Sunday
+                
+                feature_map = {
+                    "sin_hour": float(np.sin(2 * np.pi * hour / 24.0)),
+                    "cos_hour": float(np.cos(2 * np.pi * hour / 24.0)),
+                    "dow": float(dow),
+                    "lag_1": prev,
+                    "rolling_3": rolling,
+                }
+                
+                X_vec = [[feature_map.get(name, last) for name in xgb_features]]
+                dmat = xgb.DMatrix(np.array(X_vec), feature_names=xgb_features)
+                pred_val = float(xgb_model.predict(dmat)[0])
+                
+                # Add prediction to history for next iteration
+                history.append(pred_val)
+                
+                # Store every 30 steps for debug
+                if step % 30 == 0 or step == req.horizon - 1:
+                    debug_preds.append({
+                        "step": step + 1,
+                        "hour": round(hour, 2),
+                        "dow": dow,
+                        "pred": round(pred_val, 4)
+                    })
+            
+            # Return the final prediction
+            preds["xgb"] = history[-1]
+            if req.debug and debug_preds:
+                preds["xgb_debug"] = debug_preds
+    except Exception as e:
         preds["xgb"] = None
+        if req.debug:
+            preds["xgb_error"] = str(e)
 
     try:
         from tensorflow.keras.models import load_model as _load_model
@@ -238,20 +295,92 @@ def predict(req: ForecastRequest):
             tmp_scaler = None
             if scaler_path.exists():
                 tmp_scaler = _joblib.load(scaler_path)
-            seq = np.array(req.recent_window[-60:])
-            if seq.shape[0] < 60:
-                seq = np.pad(seq, (60 - seq.shape[0], 0), mode="edge")
-            try:
+            
+            # Get current timestamp for features
+            ts_list = req.recent_timestamps or []
+            if ts_list and len(ts_list) == len(req.recent_window):
+                try:
+                    current_ts = datetime.fromisoformat(ts_list[-1])
+                except ValueError:
+                    current_ts = datetime.utcnow()
+            else:
+                current_ts = datetime.utcnow()
+            
+            # Start with recent history - need to build full feature arrays
+            power_history = list(req.recent_window[-60:])
+            if len(power_history) < 60:
+                power_history = [power_history[0]] * (60 - len(power_history)) + power_history
+            
+            # Iteratively predict for horizon steps
+            for step in range(req.horizon):
+                current_ts = current_ts + timedelta(minutes=1)
+                
+                # Build feature matrix for last 60 steps (6 features each)
+                feature_matrix = []
+                for i, power_val in enumerate(power_history[-60:]):
+                    # Calculate time-based features for each historical point
+                    ts_offset = current_ts - timedelta(minutes=60-i)
+                    hour = ts_offset.hour + ts_offset.minute / 60.0
+                    dow = ts_offset.weekday()
+                    
+                    # Get lag and rolling features
+                    if i == 0:
+                        lag_1 = power_val
+                        rolling_3 = power_val
+                    elif i < 3:
+                        lag_1 = power_history[-60:][i-1] if i > 0 else power_val
+                        rolling_3 = float(np.mean(power_history[-60:][:i+1]))
+                    else:
+                        lag_1 = power_history[-60:][i-1]
+                        rolling_3 = float(np.mean(power_history[-60:][i-3:i+1]))
+                    
+                    feature_matrix.append([
+                        power_val,
+                        float(np.sin(2 * np.pi * hour / 24.0)),
+                        float(np.cos(2 * np.pi * hour / 24.0)),
+                        float(dow),
+                        lag_1,
+                        rolling_3
+                    ])
+                
+                feature_matrix = np.array(feature_matrix)
+                
+                # Scale the features
+                try:
+                    if tmp_scaler is not None:
+                        scaled = tmp_scaler.transform(feature_matrix)
+                        # X is features 1-5 (excluding power), shape (60, 5)
+                        X_input = scaled[:, 1:].reshape(1, 60, 5)
+                    else:
+                        X_input = feature_matrix[:, 1:].reshape(1, 60, 5)
+                except Exception as e:
+                    print(f"LSTM scaling error: {e}")
+                    X_input = feature_matrix[:, 1:].reshape(1, 60, 5)
+                
+                # Predict (returns scaled power value)
+                p = tmp_model.predict(X_input, verbose=0)
+                pred_scaled = float(p.flatten()[0])
+                
+                # Inverse transform to get actual power value
+                # Create dummy array with scaled prediction in power column
                 if tmp_scaler is not None:
-                    scaled = tmp_scaler.transform(seq.reshape(-1, 1)).reshape(1, 60, 1)
+                    dummy = np.zeros((1, 6))
+                    dummy[0, 0] = pred_scaled
+                    # Use mean values for other features (they don't matter for inverse transform)
+                    dummy[0, 1:] = scaled[-1, 1:]
+                    pred_val = tmp_scaler.inverse_transform(dummy)[0, 0]
                 else:
-                    scaled = seq.reshape(1, 60, 1)
-            except Exception:
-                scaled = seq.reshape(1, 60, 1)
-            p = tmp_model.predict(scaled)
-            preds["lstm"] = float(p.flatten()[-1])
+                    pred_val = pred_scaled
+                
+                # Add prediction to history for next iteration
+                power_history.append(float(pred_val))
+            
+            # Return the final prediction
+            preds["lstm"] = power_history[-1]
     except Exception as exc:
         print("LSTM on-demand load/predict failed:", exc)
+        import traceback
+        traceback.print_exc()
 
     available = [v for v in preds.values() if v is not None]
     if not available:

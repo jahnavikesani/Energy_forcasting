@@ -1,10 +1,14 @@
 import pandas as pd
 import xgboost as xgb
 import joblib
+import sys
+from pathlib import Path
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error
+
+# Add parent directory to path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.utils import load_processed
-from pathlib import Path
 
 MODEL_DIR = Path(__file__).resolve().parents[1] / "app" / "models"
 MODEL_DIR.mkdir(parents=True, exist_ok=True)

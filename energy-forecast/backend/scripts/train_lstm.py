@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+import sys
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
@@ -7,6 +8,9 @@ from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_squared_error
 from pathlib import Path
 import joblib
+
+# Add parent directory to path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.utils import load_processed
 
 MODEL_DIR = Path(__file__).resolve().parents[1] / "app" / "models"

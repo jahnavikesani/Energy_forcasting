@@ -5,8 +5,12 @@ Usage: python train_arima.py
 import argparse
 import joblib
 import pandas as pd
+import sys
 from statsmodels.tsa.arima.model import ARIMA
 from pathlib import Path
+
+# Add parent directory to path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.utils import load_processed, save_processed
 
 MODEL_DIR = Path(__file__).resolve().parents[1] / "app" / "models"
